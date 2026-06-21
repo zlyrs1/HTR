@@ -124,33 +124,6 @@ instruction
 `-- Le
 ```
 
-Before running the parser, create the Ollama models from the provided modelfiles:
-
-```bash
-cd Qwen
-ollama create qwen00 -f qwen00.modelfile
-ollama create qwen01 -f qwen01.modelfile
-ollama create qwen02 -f qwen02.modelfile
-```
-
-Then set `JSON_FILE` in each `loadInstruct*.py` script to the target AerialVLN split file and run the stages sequentially:
-
-```bash
-python loadInstruct00.py
-python loadInstruct01.py
-python loadInstruct02.py
-```
-
-During model training and evaluation, `src/vlnce_src/env.py` encodes `Subtask`, `nA`, `nL`, `Ae`, and `Le` with the CLIP text encoder and provides them to the policy as:
-
-```text
-subtask_embedding
-nA_embedding
-nL_embedding
-Ae_embedding
-Le_embedding
-```
-
 ## Repository Structure
 
 ```text
