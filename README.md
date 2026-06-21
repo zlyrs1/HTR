@@ -104,20 +104,6 @@ python -u ./src/vlnce_src/train.py --project_prefix /path/to/HTR_ws
 
 HTR uses an offline Qwen-based parsing pipeline to construct the hierarchical task tree before training or evaluation. The parser reads AerialVLN-style episode JSON files and augments each episode's `instruction` field with multi-level semantic fields used by the navigation policy.
 
-The parser scripts and Ollama model definitions are provided in `Qwen/`:
-
-```text
-Qwen
-|-- loadInstruct00.py        # Stage 0: instruction standardization
-|-- loadInstruct01.py        # Stage 1: component parsing and subtask construction
-|-- loadInstruct02.py        # Stage 2: action/landmark element extraction
-|-- loadInstruct_simple.py   # Simple one-stage parser for ablation or comparison
-|-- qwen00.modelfile
-|-- qwen01.modelfile
-|-- qwen02.modelfile
-`-- qwen_simple.modelfile
-```
-
 The three-stage pipeline is:
 
 1. **Instruction standardization**: `loadInstruct00.py` uses `qwen00` to normalize raw navigation text and saves `preprocessed_text`.
