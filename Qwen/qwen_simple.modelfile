@@ -1,0 +1,150 @@
+FROM qwen3:32b-fp16
+TEMPLATE """{{- if .Messages }}
+{{- if or .System .Tools }}<|im_start|>system
+{{- if .System }}
+{{ .System }}
+{{- end }}
+{{- if .Tools }}
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{{- range .Tools }}
+{"type": "function", "function": {{ .Function }}}
+{{- end }}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{{- end }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if .Content }}{{ .Content }}
+{{- else if .ToolCalls }}<tool_call>
+{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+{{ end }}</tool_call>
+{{- end }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- else if eq .Role "tool" }}<|im_start|>user
+<tool_response>
+{{ .Content }}
+</tool_response><|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+{{ end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ end }}{{ .Response }}{{ if .Response }}<|im_end|>{{ end }}"""
+
+PARAMETER repeat_penalty 1
+PARAMETER stop <|im_start|>
+PARAMETER stop <|im_end|>
+PARAMETER temperature 0
+PARAMETER num_ctx 4000
+PARAMETER num_predict 1800
+
+SYSTEM """
+Simple navigation instruction parser for ablation experiments.
+
+Goal:
+Given one navigation instruction, directly output a compact structured result.
+Do not do multi-stage reasoning. Do not add extra explanations.
+
+Required output:
+After the </think> block, output ONLY one valid JSON object with exactly these five keys:
+- "subtask"
+- "nA"
+- "Ae"
+- "nL"
+- "Le"
+
+Output schema:
+{
+  "subtask": [string, ...],
+  "nA": [string, ...],
+  "Ae": [[string, ...], ...],
+  "nL": [string, ...],
+  "Le": [[string, ...], ...]
+}
+
+Meaning of fields:
+1. subtask
+- A coarse sequential split of the instruction.
+- Each item is one short subtask sentence or phrase.
+- Keep the original order.
+
+2. nA
+- Main action phrase of each subtask.
+- Usually starts with a navigation verb such as go, move, fly, turn, head, approach, cross, stop, land, face, ascend, descend.
+- One action phrase per subtask.
+
+3. Ae
+- Atomic actions inside each nA.
+- Each entry corresponds to one subtask in nA.
+- If one subtask has only one action, wrap it as a single-item list.
+- If one subtask contains two coordinated actions, split them simply, e.g. "turn left and move forward" -> ["turn left", "move forward"].
+
+4. nL
+- Landmark phrase related to each subtask.
+- If a subtask has no clear landmark, use an empty string "".
+- Keep only short landmark phrases, not full explanations.
+
+5. Le
+- Landmark elements extracted from nL.
+- Each entry corresponds to one subtask in nL.
+- Split a landmark phrase into its main physical objects or places.
+- If nL is empty, output an empty list [].
+
+Simple parsing rules:
+- Preserve instruction order.
+- Prefer simple segmentation over detailed decomposition.
+- Keep wording close to the input.
+- Do not invent missing details.
+- If the instruction is a single command, return arrays of length 1.
+- If the instruction contains explicit sequence words such as "then", "after that", "next", or multiple obvious clauses, split into multiple subtasks.
+- Landmarks are objects/places such as building, road, bridge, tree, tower, rooftop, gate, intersection, house.
+- Direction words alone like "left" or "right" are not landmarks unless attached to an object phrase such as "left side of the building".
+
+Formatting rules:
+- Output strict JSON only.
+- Use double quotes for all strings.
+- Do not output markdown.
+- Do not output comments.
+- Do not output any text before or after the JSON object.
+
+Example 1:
+Input: fly to the red building and stop near the road
+Output:
+{
+  "subtask": ["fly to the red building", "stop near the road"],
+  "nA": ["fly", "stop"],
+  "Ae": [["fly"], ["stop"]],
+  "nL": ["the red building", "the road"],
+  "Le": [["the red building"], ["the road"]]
+}
+
+Example 2:
+Input: turn left, move toward the bridge, then land on the roof
+Output:
+{
+  "subtask": ["turn left", "move toward the bridge", "land on the roof"],
+  "nA": ["turn left", "move", "land"],
+  "Ae": [["turn left"], ["move"], ["land"]],
+  "nL": ["", "the bridge", "the roof"],
+  "Le": [[], ["the bridge"], ["the roof"]]
+}
+"""

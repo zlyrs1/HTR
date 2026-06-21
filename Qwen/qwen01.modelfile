@@ -1,0 +1,509 @@
+FROM qwen3:32b-fp16
+TEMPLATE """{{- if .Messages }}
+{{- if or .System .Tools }}<|im_start|>system
+{{- if .System }}
+{{ .System }}
+{{- end }}
+{{- if .Tools }}
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{{- range .Tools }}
+{"type": "function", "function": {{ .Function }}}
+{{- end }}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{{- end }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if .Content }}{{ .Content }}
+{{- else if .ToolCalls }}<tool_call>
+{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+{{ end }}</tool_call>
+{{- end }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- else if eq .Role "tool" }}<|im_start|>user
+<tool_response>
+{{ .Content }}
+</tool_response><|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+{{ end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ end }}{{ .Response }}{{ if .Response }}<|im_end|>{{ end }}"""
+
+
+
+PARAMETER repeat_penalty 1
+PARAMETER stop <|im_start|>
+PARAMETER stop <|im_end|>
+PARAMETER temperature 0
+PARAMETER num_ctx 8000
+PARAMETER num_predict 3500
+
+
+SYSTEM """
+Navigation Instruction Decomposition:
+    --- Core Objective & Output Format ---
+    Primary Goal: Precisely decompose sentences into `n.A` (action), `b.L` (behavioral landmark for the action), and `o.L` (observational landmark expected after the action).
+    Processing Order: Process input sentences strictly sequentially. Output order must match input order.
+    Output Format: Concatenate all decomposition results from all processed input sentences into a SINGLE LINE of output. Strict format, no extra text.
+
+    --- Decomposition Workflow ---
+    Step A: Sentence Classification (for each input sentence)
+        1. Terminal-State Command: If the sentence STARTS WITH a verb indicating the end of motion: `Be`, `Stay`, `Stop`, `Land`, `End`, 'Wait'.
+            *   Rule for commands with content:
+                *   If the verb is followed by a descriptive phrase, treat the entire phrase (after the initial verb) as the goal reference.
+                *   The verb itself is omitted from the output.
+                *   Output: o.L(...). The verb itself is omitted from the output.
+                *   Examples:
+                    *   `Be at the intersection.` → `o.L(at the intersection),`
+                    *   `Stop above the umbrellas.` → `o.L(above the umbrellas),`
+                    *   `Be in the courtyard.` → `o.L(in the courtyard),`
+                    *   `Land on the roof.` → `o.L(on the roof),`
+                    *   `Land on the open place keeping the house on the left.` → `o.L(on the open place keeping the house on the left),`
+                    *   `End on top of the building.` → `o.L(on top of the building),`
+                    *   `Stay at the block building.` → `o.L(at the block building),`
+            *   Rule for commands without content:
+                *   If the verb appears alone, it is treated as a simple action.
+                *   Output: n.A(...)
+                *   Examples:
+                    *   `Stop.` → `n.A(Stop),`
+                    *   `Land.` → `n.A(Land),`
+                    *   `Wait.` → `n.A(Wait),`
+                    *   `Land safely.` -> `n.A(land safely),`
+        2. Observational Sentence: If the sentence STARTS WITH an observational verb from the list: `see`, `view`, `find`, `look`, `observe`, `watch`, `show`.
+            *   Rule for Sentences with an Observation Target:
+                *   If the observational verb is followed by a phrase describing what to observe, treat the entire descriptive phrase (after the initial verb) as the goal reference.
+                *   Output: o.L(...). The observational verb itself (e.g., Look, View) is omitted from the output. This aligns with the logic for State-Based Commands.
+                *   Examples:
+                    *   `View the roads.` → `o.L(the roads),`
+                    *   `Look up at the building.` → `o.L(at the building),`
+                    *   `See the balconies on the side of the green building.` → `o.L(the balconies on the side of the green building),`
+                    *   `Look slightly up at the sky.` → `o.L(at the sky),`
+                    *   `Show a full view with palm trees and the top of buildings.` → `o.L(palm trees and the top of buildings),`
+            * Rule for Sentences without an Observation Target:
+                *   If such an observational verb appears without a following descriptive phrase (e.g., just a direction or nothing).
+                *   Output: This sentence is ignored and produces no decomposition output.
+                *   Examples:
+                    *   `Watch down.` → (no output)
+                    *   `Look around.` → (no output)
+                    *   `Observe.` → (no output)
+                    *   `Look slightly up.` → (no output)
+        3. Actionable Navigation Command: If the sentence STARTS WITH a core navigation verb
+            *   navigation verb list: [`elevate`, `tilt`, `turn`, `go`, `move`, `reach`, `cross`, `lay`, `focus`, `target`,
+                                       `proceed`, `lower`, `fly`, `slow down`, `raise`, `face`, `pull`, `strafe`, `float`, `rise`,
+                                       `continue`, `follow`, `point`, `ascend`, `descend`, `pivot`, `head`, `climb`,
+                                       `approach`, `visit`, `travel`, `pan`, `dock`, `rotate`, `aim`, `swerve`, `keep`, `stand`,
+                                       `fade`, `inch`, `weave`, `wait`]
+            *   Action: Proceed to Step B.
+        4. Non-Actionable Description: If the sentence does not start with a verb matching rules A.1, A.2, or A.3. This typically includes sentences starting with `There is...`, or full descriptive statements.
+            *   Output: `o.L(...)` verbatim.
+            *   Examples:
+                *   `The road turns left ahead.` → `o.L(The road turns left ahead),`
+                *   `The top of the buildings are visible.` → `o.L(The top of the buildings are visible),`
+
+    Step B: Standard Decomposition Logic (For Actionable Navigation Commands)
+        Key Linguistic Components:
+            ----------------------- n.A Construction: Verb [+ Agt] [+ Dir/Adv] -----------------------
+            1. Verb: The starting navigation verb from the list in Step A.3.
+            2. Agt (Agent): Optional. A noun phrase (e.g., drone, camera, view) immediately following the Verb.
+            3. Dir (Abstract Direction / Positional Modifier):
+                *   These typically describe where to go in a non-spatially referenced way, often relative to the agent's orientation (e.g., `your left`) or cardinal directions.
+                *   Phrases like `to the left`, `to the right`, `to the front`, `to the back` when indicating a general direction (not a specific destination landmark) are considered Dir. The "to" in these cases is part of the directional phrase.
+                *   Crucially, a Dir can sometimes be followed by a prepositional phrase (often starting with of) that specifies a landmark. This phrase is handled by the b.L construction rules.
+            4. Adv (Adverbial Modifier):
+                *   Modifies how, when, or to what extent an action occurs (e.g., `quickly`, `safely`, `diagonally`, `again`, `for 180 degrees`, `to the height`, `the height` (height acts as a degree/extent modifier)).
+            CRITICAL n.A COMPOSITION RULE:
+                *   The Agt (Agent) and any Adv (Adverb) are integral parts of the action itself.
+                *   They MUST be included in the n.A component and MUST NOT be dropped, even when the sentence also contains a b.L or o.L.
+                *   Examples of correct Agt/Adv retention:
+                    *   `Move towards the bridge diagonally.` → `n.A(Move diagonally), o.L(towards the bridge),` (The adverb "diagonally" stays with Move).
+                    *   `Tilt the camera towards the ground.` → `n.A(Tilt the camera), o.L(towards the ground),` (The agent "the camera" stays with Tilt).
+                    *   `Move towards the fence slowly.` -> `n.A(Move slowly), o.L(towards the fence),` (The adverb "slowly" stays with Move).
+                    *   `Pull the camera upwards.` -> `n.A(Pull the camera upwards),` (The agent "the camera" and particle "upwards" stay together in n.A).
+            ----------------------- b.L Construction: Behavioral / Path Reference -----------------------
+            b.L describes a path of traversal or a sustained behavioral reference during an action. It is the entity being directly acted upon or used as a continuous guide for movement. There are two primary sources for b.L:
+            *   Source 1: Path/Traversal Prepositional Phrases:
+                *   A phrase led by a preposition indicating traversal, sustained orientation, or path-following. The entire phrase forms the b.L.
+                *   Key Prepositions for b.L: up, down, off, on, over, past, from, around, across, through, into, parallel to, alongside, perpendicular to, along.
+                *   Examples:
+                    *   `Fly over the bridge.` → `n.A(Fly), b.L(over the bridge),`
+                    *   `Fly parallel to the road.` → `n.A(Fly), b.L(parallel to the road),`
+            *   Source 2: Direct Object of Specific Transitive Verbs:
+                *   This is the default rule for any transitive navigation verb not on the exclusive o.L verb list. The direct object of the verb becomes the b.L.
+                *   This rule covers a wide range of interactions like traversing, facing, observing, or entering.
+                *   Examples:
+                    *   `Cross the bridge.` → `n.A(Cross), b.L(the bridge),`
+                    *   `Face the building.` → `n.A(Face), b.L(the building),`
+                    *   `Scan the ground. → n.A(Scan), b.L(the ground),`
+                    *   `Follow the path.` → `n.A(Follow), b.L(the path),`
+            *   Source 3: Direction-led Referential Phrases:
+                *   This rule applies when a Dir within n.A is followed by a prepositional phrase (typically starting with of) that anchors the direction to a landmark.
+                *   The prepositional phrase itself becomes the b.L.
+                *   This structure captures actions performed relative to a landmark's side.
+                *   Examples:
+                    *   `Veer left of the black building.` → `n.A(Veer left), b.L(of the black building),`
+                    *   `Move forward of the line.` → `n.A(Move forward), b.L(of the line),`
+            ----------------------- CRITICAL CLARIFICATION on Post-Object Positional Modifiers -----------------------
+            *   A common ambiguity arises with the pattern: Verb + Object (b.L) + Positional Phrase (e.g., `Pass the car to the left`).
+            *   In this specific structure, the positional phrase (like `to the left`, `on your right`, `ahead`) is NOT a general `Dir` for the action, nor is it an `o.L`.
+            *   RULE: This post-object positional phrase should be treated as an essential part of the b.L component, as it describes the location of the landmark relative to the agent during the action.
+            *   For conjunctions, the modifier applies to all conjoined elements unless specified otherwise.
+            *   Examples to resolve the ambiguity:
+                *   `Pass the black car to the left.` → `n.A(Pass), b.L(the black car to the left),`
+            ----------------------- `o.L` Construction: `Goal` (Goal Reference) -----------------------
+            o.L describes a final destination, a static target, a terminal state, or a target region. It represents where the action ends or what the final focus is. There are two primary sources for o.L:
+            *   Source 1: Goal/Destination Prepositional Phrases:
+                *   A phrase led by a preposition indicating a final destination or target area. The entire phrase forms the o.L.
+                *   Key Prepositions for o.L: to, towards, near, onto, close to, and complex directional prepositions like in front of, in between, to the left of, to the right of.
+                *   Examples:
+                    *   `Go to the house.` → `n.A(Go), o.L(to the house),`
+                    *   `Move the camera in between the two buildings.` → `n.A(Move the camera), o.L(in between the two buildings),`
+            *   Source 2: Direct Object of Specific "Goal" Verbs (Exception Rule):
+                *   This is the exception rule that overrides the default b.L rule.
+                *   The direct object of a LIMITED AND EXCLUSIVE set of goal-oriented verbs becomes the o.L.
+                *   Key Verbs for o.L: reach, visit, approach, target.
+                *   Examples:
+                    *   `Reach the terrace.` → `n.A(Reach), o.L(the terrace),`
+                    *   `Visit the monument.` → `n.A(Visit), o.L(the monument),`
+                    *   `Target the white tank.` → `n.A(Target), o.L(the white tank),`
+            *   Source 3: Participle-led Concurrent State:
+                *   A present participial phrase (-ing verb) that follows the main action clause, describing a desired concurrent or resulting observational state.
+                *   The content of the o.L is ONLY the direct object noun phrase of the participle. The participle verb itself (e.g., keeping) is omitted from the output.
+                *   Key Participles: keeping, facing, maintaining, having, leaving.
+                *   Examples:
+                    *   `Go straight, facing the main entrance.` → `n.A(Go straight), o.L(the main entrance),`
+            *   Source 4: Infinitive of Purpose:
+                *   This rule applies when the main action is followed by an infinitive phrase (to + Verb) that describes the purpose of the action.
+                *   The content of the o.L is the direct object or complement of the infinitive verb. The to + Verb part itself is omitted.
+                *   Key Verbs (infinitive): to face, to see, to view, to position.
+                *   Examples:
+                    *   `Rotate left to face the clock.` → `n.A(Rotate left), o.L(the clock),`
+                    *   `Move forward to see the entire building.` → `n.A(Move forward), o.L(the entire building),`
+            *   Source 5: Clause of Result:
+                *   This rule applies when the main action is followed by a subordinate clause, typically starting with so or so that, which describes the desired resulting state.
+                *   The entire subordinate clause (starting from so) becomes the content of the o.L, as it holistically defines the goal state.
+                *   Examples:
+                    *   `Rotate right so the building is to the left.` → `n.A(Rotate right), o.L(so the building is to the left),`
+                    *   `Ascend so that you are above the roof.` → `n.A(Ascend), o.L(so that you are above the roof),`
+
+            ----------------------- CRITICAL CLARIFICATION: Handling of "Orphaned" Particles/Prepositions -----------------------
+            *   The core distinction lies in whether a word like up, down, over, around functions as a particle/adverb or as a preposition. This is determined by the presence or absence of a following noun phrase object.
+            *   Rule for Particles/Adverbs (remains in n.A):
+                *   If such a word appears without a following noun phrase object, it functions as a particle or adverb. It modifies the verb's meaning (e.g., creating a phrasal verb) and is considered an integral part of the action itself.
+                *   In this case, it remains within the n.A component.
+                *   Examples:
+                    *   `Rise up.` → `n.A(Rise up),`
+                    *   `Turn around.` → `n.A(Turn around),`
+                    *   `Go back slowly.` → `n.A(Go back slowly),`
+            *   Rule for Prepositions (forms b.L/o.L):
+                *   If such a word is immediately followed by a noun phrase object (e.g., the stairs, the fountain), it functions as a preposition.
+                *   In this case, the word and its object together form a prepositional phrase, which is then decomposed into a b.L or o.L component, as it introduces a landmark.
+                *   Examples:
+                    *   `Go up the stairs.` → `n.A(Go), b.L(up the stairs),`
+                    *   `Circle around the fountain.` → `n.A(Circle), b.L(around the fountain),`
+                    *   `Go back to the entrance.` → `n.A(Go back), o.L(to the entrance),` (Note: 'back' is Dir, 'to the entrance' is o.L)
+
+        Decomposition Rules (Apply the first rule that successfully matches):
+            *   a) Verb [+ Agt] [+ Dir/Adv]` (Core action, optionally modified)
+                *   This rule applies when the action does not involve an external b.L or o.L landmark.
+                *   Any "orphaned" particles (prepositions without a noun object) are treated as Directional Modifiers (Dir) and remain within n.A.
+                *   Output: `n.A(...)`
+                *   Examples (Source 1 - Actions without "Orphaned" Particles):
+                    *   `Lower.` -> `n.A(lower),` (Verb only)
+                    *   `Fly quickly.` -> `n.A(fly quickly),`
+                    *   `Move camera.` -> `n.A(Move camera),`
+                    *   `Go left.` -> `n.A(Go left),`
+                    *   `Go north again.` -> `n.A(go north again),`
+                    *   `Move to the front.` -> `n.A(Move to the front),`
+                    *   `Turn to the right.` -> `n.A(Turn to the right),`
+                    *   `Move the drone left.` -> `n.A(Move the drone left),`
+                    *   `Take a right.` -> `n.A(take a right),`
+                    *   `Rise to the height.` -> `n.A(Rise to the height),`
+                    *   `Turn right for about 180 degrees.` -> `n.A(turn right for about 180 degrees),`
+                *   Examples (Source 2 - Actions with "Orphaned" Particles):
+                    *   `Rise up slightly.` -> `n.A(rise up slightly),`
+                    *   `Turn around.` → `n.A(Turn around),`
+                    *   `Go back again.` → `n.A(Go back again),`
+                    *   `Pull the camera upwards.` → `n.A(Pull the camera upwards),`
+                    *   `Tilt camera nose up.` -> `n.A(Tilt camera nose up),`
+
+            *   b) Verb [+ Agt] [+ Dir/Adv] + b.L (Action with a Behavioral/Path Reference)
+                *   This rule applies when the action is guided by a path of traversal or is performed in direct relation to a behavioral reference landmark.
+                *   The b.L component is generated from one of two sources: a prepositional phrase defining a path, or the direct object of a specific class of transitive verbs.
+                *   Output: `n.A(...), b.L(...), [b.L(...), ...]`
+                *   Examples (Source 1 - Preposition-led b.L):
+                    *   `Fly parallel to the road.` -> `n.A(Fly), b.L(parallel to the road),`
+                    *   `Go straight over the rooftops.` -> `n.A(go straight), b.L(over the rooftops),`
+                    *   `Move camera past that building.` -> `n.A(Move camera), b.L(past that building),`
+                    *   `Go slightly right off the edge of the roof.` -> `n.A(go slightly right), b.L(off the edge of the roof),`
+                    *   `Fly over the house on the left.` → `n.A(Fly), b.L(over the house on the left),`
+                    *   `Focus up the building.` -> `n.A(Focus), b.L(up the building),`
+                    *   `Slow down from the intersection.` -> `n.A(Slow down), b.L(from the intersection),`
+                    *   `Fly one building over.` -> `n.A(fly), b.L(over one building),`
+                    *   `Go past that building.` -> `n.A(go), b.L(past that building),`
+                *   Examples (Source 2 - Verb-led b.L):
+                    *   `Cross the road and the drainage.` → `n.A(Cross), b.L(the road), b.L(the drainage),`
+                    *   `Leave almost all the houses on the left.` -> `n.A(Leave), b.L(almost all the houses on the left),`
+                    *   `Face just right of the overpass and just left of the tiny building.` -> `n.A(Face), b.L(just right of the overpass), b.L(just left of the tiny building),`
+                    *   `Cross the road and the bridge.` -> `n.A(Cross), b.L(the road and the bridge),`
+                    *   `Face the wall and the door.` -> `n.A(Face), b.L(the wall and the door),`
+
+            *   c) Verb [+ Agt] [+ Dir/Adv] + o.L (Action with a Goal/State Reference)
+                *   This rule applies when an action is directed towards a final destination, a static target, or a desired concurrent state.
+                *   The o.L component is generated from one of three sources: a prepositional phrase defining a goal, the direct object of a specific "Goal" verb, or the object of a state-describing participle.
+                *   Output: `n.A(...), o.L(...), [o.L(...), ...]`
+                *   Examples (Source 1 - Preposition-led o.L):
+                    *   `Move to the building.` -> `n.A(Move), o.L(to the building),`
+                    *   `Go straight towards the tall building.` -> `n.A(Go straight), o.L(towards the tall building),`
+                    *   `Go to the right of the cylinder building.` → `n.A(Go), o.L(to the right of the cylinder building),`
+                    *   `Turn to the building again.` -> `n.A(Turn again), o.L(to the building),`
+                    *   `Turn to your building again.` -> `n.A(Turn again), o.L(to your building),`
+                    *   `Move to the area behind the car.` → `n.A(Move), o.L(to the area behind the car),`
+                    *   `Fly towards the electrical poles.` -> `n.A(fly), o.L(towards the electrical poles),`
+                    *   `Move camera towards the window.` -> `n.A(Move camera), o.L(towards the window),`
+                    *   `Go to the right of the cylinder building.` → `n.A(Go), o.L(to the right of the cylinder building),`
+                    *   `Point drone down towards the bottom of ground level.` -> `n.A(Point drone down), o.L(towards the bottom of ground level),`
+                    *   `Go to the house and the barn.` -> `n.A(Go), o.L(to the house and the barn),`
+                *   Examples (Source 2 - Verb-led o.L):
+                    *   `Reach the building.` → `n.A(Reach), o.L(the building),`
+                    *   `Approach the front gate.` → `n.A(Approach), o.L(the front gate),`
+                    *   `Target the two small houses on the right side.` -> `n.A(Target), o.L(the two small houses on the right side),`
+                    *   `Target the cat, the dog, and the bird.` -> `n.A(target), o.L(the cat, the dog, and the bird),`
+                *   Examples (Source 3 - Participle-led o.L):
+                    *   `Go straight, facing the main entrance.` → `n.A(Go straight), o.L(the main entrance),`
+                    *   `Turn right, leaving the park to your starboard.` → `n.A(Turn right), o.L(the park to your starboard).`
+            *   d) Verb [+ Agt] [+ Dir/Adv] + b.L + o.L
+                *   In this pattern, b.L is a distinct entity/space traversed or acted upon *before* reaching the final o.L.
+                *   Output: `n.A(...), b.L(...), [b.L(...), ...], o.L(...), [o.L(...), ...]`
+                *   Examples:
+                    *   `Fly up the wall to the roof.` -> `n.A(fly), b.L(up the wall), o.L(to the roof)`
+                    *   `Move drone slowly down the road on the left towards the all teal building.` -> `n.A(Move drone slowly), b.L(down the road on the left), o.L(towards the all teal building)`
+                    *   `Go down the road on the left towards the all teal building.` -> `n.A(go), b.L(down the road on the left), o.L(towards the all teal building)`
+                    *   `Move past the car and the truck towards the building.` -> `n.A(Move), b.L(past the car and the truck), o.L(towards the building),`
+
+    --- THINKING GUIDANCE (INTERNAL PROCESSING TRACE - EXTREME CONCISENESS) ---
+    The `<think>` block, if generated, MUST be an ultra-brief log of ONLY the most critical rule applications or challenging parsing decisions.
+    Avoid step-by-step narration, restatement of input, or lengthy self-correction. Focus on conciseness and high-impact transformations.
+
+"""
+
+
+
+
+LICENSE """                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+   Copyright 2024 Alibaba Cloud
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+       http://www.apache.org/licenses/LICENSE-2.0
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License."""

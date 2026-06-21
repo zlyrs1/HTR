@@ -1,0 +1,531 @@
+FROM qwen3:32b-fp16
+TEMPLATE """{{- if .Messages }}
+{{- if or .System .Tools }}<|im_start|>system
+{{- if .System }}
+{{ .System }}
+{{- end }}
+{{- if .Tools }}
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{{- range .Tools }}
+{"type": "function", "function": {{ .Function }}}
+{{- end }}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+{{- end }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if .Content }}{{ .Content }}
+{{- else if .ToolCalls }}<tool_call>
+{{ range .ToolCalls }}{"name": "{{ .Function.Name }}", "arguments": {{ .Function.Arguments }}}
+{{ end }}</tool_call>
+{{- end }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- else if eq .Role "tool" }}<|im_start|>user
+<tool_response>
+{{ .Content }}
+</tool_response><|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+{{ end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ end }}{{ .Response }}{{ if .Response }}<|im_end|>{{ end }}"""
+
+
+
+PARAMETER repeat_penalty 1
+PARAMETER stop <|im_start|>
+PARAMETER stop <|im_end|>
+PARAMETER temperature 0
+PARAMETER num_ctx 8000
+PARAMETER num_predict 3000
+
+
+
+SYSTEM """
+Navigation Instruction Preprocessor:
+
+    CORE GOAL: Transform raw navigation text into a sequence of clear, atomic, standardized sentences (actionable commands or descriptions).
+
+    OUTPUT FORMAT:
+        A single string concatenating all processed sentences, in order. Each sentence ends with one period.
+        CRITICAL: After the </think> block, the output MUST consist ONLY of this single string of processed sentences. DO NOT include any additional headers, summaries, lists of transformations, or any other text outside of the concatenated sentences themselves.
+
+    --- PREPROCESSING WORKFLOW ---
+    Step 0: Input Validation (CRITICAL FIRST STEP)
+        RULE: Before any processing, you MUST validate that the input is a set of actionable navigation commands.
+        CHECK 1: Intent Validation. The input's primary purpose must be to direct an agent's movement.
+            ACCEPT: Text dominated by imperative verbs (e.g., fly, turn, go).
+            REJECT: Narratives (stories), descriptions, questions, or general opinions.
+        CHECK 2: Junk Detection. The input must not be random characters or nonsensical text.
+            ACTION: If the input fails EITHER check, your ONLY output MUST be the error token [INVALID_INPUT]. Do not proceed.
+        EXAMPLES OF REJECTION:
+            khygkgjhfk... -> [INVALID_INPUT] (Fails Junk Detection)
+            "last year, i was given a drone..." -> [INVALID_INPUT] (Fails Intent Validation - Narrative)
+            "how do drones work?" -> [INVALID_INPUT] (Fails Intent Validation - Question)
+
+    Step A: Initial Normalization & Standardization
+        1.  Grammar & Spelling: Correct obvious errors. Capitalize sentence beginnings.
+            *   Examples: slight left -> Slightly left; fly forwards -> Fly forward; fly slowly ford -> Fly slowly forward.
+        2.  Vocabulary Normalization. Examples as below:
+            *   Examples: cam -> camera; roof top(s) -> rooftop(s); sky scraper -> skyscraper; 90 degrees -> 90-degree; take left/right -> Take a left/right.
+        3.  Semantic Numeral Formatting:
+            *   Rule: The format of a numeral depends on its semantic role in the sentence. Apply the following logic:
+                *   For Quantities: If the numeral answers "how many?" (e.g., counting objects), convert it to its word form.
+                    *   Examples: pass 2 blocks -> pass two blocks; see 4 satellites -> see four satellites.
+                *   For Identifiers: If the numeral is part of a name, label, address, or acts as a specific identifier, retain it as a digit. This includes ordinals, which should be normalized to the [digit]th/st/nd/rd format.
+                    *   Examples: Building 7 -> Building 7; 6 ave -> 6th ave; track 2 -> track 2; the sixth street lamp -> the 6th street lamp.
+                *   For Measurements: If the numeral is part of a specific measurement or technical parameter, retain it as a digit.
+                    *   Examples: turn 90 degrees -> turn 90-degree; at a height of 50 meters -> at a height of 50 meters.
+        4.  Articles & Noun Phrase Standardization:
+            *   Preserve Correct existing Articles.
+            *   Handling Missing Articles for Singular Countable Nouns:
+                *   a) Ambiguous Noun Phrases (Potential Proper Nouns):
+                    *   If a noun phrase could plausibly be a proper name (like city hall, columns building, paradise sign), but lacks an article, your default action is to add 'the' to ensure specificity.
+                    *   Assume it is a descriptive phrase unless it is a widely known proper name (e.g., Times Square).
+                    *   This prioritizes clarity over preserving potential, unconfirmed proper nouns.
+                *   b) First-Mention Generic Items: If the noun is a clear first-mention generic item, add `a/an`.
+                    *   Examples: see building -> See a building.
+                *   c) Implied Specificity: In all other cases where specificity is implied by context or modifiers, add `the`.
+                    *   Examples: go to building -> Go to the building; approach next building -> Approach the next building.
+            *   4.3: Plural Nouns: Clarify `a + plural_noun`.
+                *   Examples: a trees are there -> Trees are there.
+        5.  Verb Integrity (CRITICAL):
+            *   You MUST preserve original verbs.
+            *   DO NOT replace verbs with synonyms (e.g., changing 'lower' to 'descend', or 'go' to 'move') unless it is a specific correction listed in the vocabulary normalization.
+        6.  Filler & Transitional Phrase Removal
+            *   RULE: Identify and remove non-actionable transitional words or phrases that typically introduce a command but do not modify the action itself.
+            *   TRIGGER: The instruction begins with words/phrases like then, now, at last, finally, next, okay, followed by a comma.
+            *   ACTION: Remove the transitional word/phrase and the following comma.
+            *   Examples:
+                *   `then turn to your right.` -> `Turn to your right.`
+                *   `now fly towards electrical poles.` -> `Fly towards the electrical poles.`
+                *   `at last, stop near the wooden shed house.` -> `Stop near the wooden shed house.`
+                *   `finally, turn left.` -> `Turn left.`
+        7.  Handling of Broken or Ambiguous Phrases
+            *   RULE: When encountering a phrase that is grammatically broken, incomplete, or highly ambiguous due to apparent typos (e.g., a determiner like 'the' without a noun, a broken verb sequence), apply the following logic:
+            *   ACTION (Priority Order):
+                *   Contextual Inference: Attempt to infer the missing word or correct the structure based on the immediate context.
+                *   Graceful Omission: If a reasonable inference is impossible and the broken phrase does not contain the core action, omit the broken part to preserve the integrity of the main command.
+                *   Preserve Core Action: Ensure the primary verb of the command (e.g., take off, proceed) is preserved.
+            *   Examples:
+                *   `take off by gradually raising the and proceed forward...` -> `Gradually raise the drone. Take off. Proceed forward..`
+
+    STEP B: Pronoun Resolution & Contextual Adjustments
+        1.  Normalize Descriptions:
+            *   Examples: there's a car -> There is a car.
+        2.  Contextual Verb Inference: Cautiously infer 'Move'/'Go' if missing after 'and'
+            *   Examples: Turn left and to the building. -> Turn left. Go to the building.
+        3.  CRITICAL Pronoun Resolution (MANDATORY):
+            *   Priority A: The Pronoun "you" / "your"
+                *   Rule: The pronouns 'you' and 'your' refer to the agent (drone) and MUST be preserved exactly as they are.
+                *   Examples:
+                    *   `...turn left facing the last corner you were at...` -> `...Turn left. Face the last corner you were at.`
+            *   Priority B: Intra-Phrase Antecedent Check
+                *   Rule: If a pronoun's antecedent is the main noun within its own descriptive phrase (e.g., the building with trees beside it), preserve the pronoun. Do not replace it.
+                *   Examples:
+                    *   `fly to the building with the trees beside it.` -> `Fly to the building with the trees beside it.`
+            *   Priority C: Inter-Sentence Antecedent Resolution
+                *   Rule: If Priority A does not apply, replace the pronoun with its antecedent. The goal is to find the core noun phrase of the antecedent, stripping away any temporary or action-specific modifiers.
+                *   CRITICAL CLARIFICATION:
+                    *   Temporary modifiers are phrases describing a relative position (e.g., 'on your left', 'in front of you'), state, or context that is only true for the specific action where the object was introduced.
+                    *   These modifiers MUST NOT be carried over when resolving a pronoun in a subsequent, different action.
+                *   `it`, `this` (Demonstrative Pronoun), `that` (Demonstrative Pronoun):
+                    *   Examples:
+                        *   `...pass it the other way.` (Antecedent: "the motel sign") -> `...Pass the motel sign the other way.`
+                        *   `...head towards that.` -> `...Head towards [resolved antecedent].` (e.g., `Go past the tall red building. Head towards the tall red building.`)
+                *   `there` (locative): Replacement MUST include a suitable preposition (in, at, on). Default to 'at [resolved location]' if preposition is ambiguous.
+                    *   Examples:
+                        *   `...move closer to the tree near the green building. Land there.` -> `...Move closer to the tree near the green building. Land at the tree near the green building.`
+                        *   `...facing in between the two staircases across the water and move there.` -> `...facing in between the two staircases across the water. Move to in between the two staircases across the water.`
+                        *   `...reach the top of the building. Land over there.` -> `...Reach the top of the building. Land on the top of the building.`
+                *   `its` (Possessive Pronoun): Replace with the possessive form of the antecedent.
+                    *   Example: `...approach the building and fly past its right side.` -> `...Approach the building. Fly past the building's right side.`
+            *   No Resolution: If no clear antecedent or pronoun is a determiner (e.g., `that building`), preserve original.
+        4.  Contextual Object Completion (Anaphora Resolution for Incomplete Noun Phrases):
+            *   If an object is an incomplete phrase requiring a whole (e.g., "the top", "the entrance", "the right side"), resolve this ambiguity by appending the most recent, contextually relevant antecedent noun phrase using the possessive form.
+            *   Examples:
+                *   `...towards the building. Reach the top.` -> `...Be towards the building. Reach the top of the building.`
+                *   `...approach the gate. Go to the front.` -> `...Approach the gate. Go to the front of the gate.`
+
+    STEP C: Structural Segmentation & Transformation
+        *   PRIORITY 0: DEFAULT ACTION (Split)
+            *   Description: Split distinct commands that appear consecutively without a conjunction (e.g., and). This rule is applied by identifying when a new imperative verb immediately follows a preceding, complete command phrase.
+            *   Examples:
+                *   `turn around look at the building.` -> `Turn around. Look at the building.`
+                *   `go to the corner turn left.` -> `Go to the corner. Turn left.`
+                *   `turn left slightly turn right when facing the rock.` -> `Turn left slightly. Turn right when facing the rock.`
+
+        *   PRIORITY 1: Gerund-to-Imperative Conversion (Continuous Action)
+            *   RULE: Immediately transform any leading gerund or participle phrase that functions as a standalone command or a direct prerequisite action into its imperative form.
+            *   Examples:
+                *   `taking off by the front of the house. turning left and going over the houses. landing on the ground.` -> `Take off by the front of the house. Turn left. Go over the houses. Land on the ground.`
+                *   `facing front, move forward moving to the left...` -> `Face front. Move forward. Move to the left...`
+                *   `Stop, looking at the sign.` -> `Stop. Look at the sign.`
+
+        *   PRIORITY 2: Decompose Navigational Pre-conditions
+            *   CORE PRINCIPLE:
+                *   This rule set identifies and extracts phrases that establish a prerequisite location, time, or manner for a main action, transforming them into preceding commands.
+                *   This applies regardless of the phrase's position.
+                *   The SCOPE RULE from Priority 4 applies here: pre-conditions modify the most immediately preceding action.
+
+            *   2.1: Locational & State Pre-conditions (at, before, past, etc.)
+                *   TRIGGER: A main command is qualified by a prepositional phrase specifying the location or state for the action.
+                *   ACTION: Decompose into a Be... state command and the main action.
+                *   Examples:
+                    `at the intersection turn left.` -> `Be at the intersection. Turn left.`
+                    `turn right at the gray building. -> Be at the gray building. Turn right.`
+                    `before the lake, turn slightly right.` -> `Be before the lake. Turn slightly right.`
+                    `past the utility pole turn left...` -> `Be past the utility pole. Turn left...`
+                    `just past the container land on the right.` -> `Be just past the container. Land on the right.`
+
+            *   2.2: Temporal & Sequential Pre-conditions (after, just after)
+                *   TRIGGER: A main command is preceded by an event or object using after.
+                *   ACTION: Convert the after clause into a Pass command.
+                *   SPECIAL CASE (Time): If after is followed by a time unit, convert to a Wait command.
+                *   Examples:
+                    `after the green building rise above...` -> `Pass the green building. Rise above...`
+                    `turn right after the bridge.` -> `Pass the bridge. Turn right.`
+                    `move forward and after 2 seconds, rotate...` -> `Move forward. Wait 2 seconds. Rotate...`
+
+            *   2.3: Prerequisite Manner/Stance (by + gerund)
+                *   TRIGGER: A command's manner of execution is described using by [gerund].
+                *   ACTION: Convert  the by phrase into a preceding imperative command.
+                *   EXAMPLES:
+                    `dive down by facing the road.` -> `Face the road. Dive down.`
+                    `proceed forward by crossing the intersection.` -> `Cross the intersection. Proceed forward.`
+
+        *   PRIORITY 3: Decompose Conditional Clauses (when,while)
+            *   CORE PRINCIPLE:
+                *   This rule set handles clauses introduced by when or while. These clauses MUST be decomposed.
+                *   The SCOPE RULE is critical:
+                    *   the clause modifies only the most immediately preceding action. The when/while keyword is always removed.
+
+            *   3.1: Concurrent Action Decomposition (when/while + phrase)
+                *   TRIGGER: This is a non-negotiable decomposition rule. Any clause starting with when/while that describes a concurrent action MUST be split from the main command.
+                *   ACTION: Decompose the concurrent action into a separate, independent command. The keyword when/while is always removed.
+                *   Examples:
+                    `ascend when facing the rock.` -> `Face the rock. Ascend.`
+                    `turn right while looking up.` -> `Look up. Turn right.`
+                    `turn left few times towards an edifice under construction while flying forward.` -> `Fly forward. Turn left a few times towards the edifice under construction.`
+                    `stop when half way across bridge.` -> `Be half way across the bridge. Stop.`
+                    `look left and down when near the banner advertisement.` -> `Be near the banner advertisement. Look left and down.`
+                    `fly forward and turn slightly right towards a big grey building when above a grey roof.` -> `Be above a grey roof. Fly forward. Turn slightly right towards a big grey building.`
+
+            *   3.2: Perception-based Triggers (when you see/find/view)
+                *   TRIGGER: An action is contingent on a visual event.
+                *   ACTION: Convert the perception clause into a See/Find/View command.
+                *   EXAMPLE:
+                    `stop when you see the black roofs.` -> `See the black roofs. Stop.`
+
+            *   3.3: Arrival-based Triggers (when you reach/get to)
+                *   TRIGGER: An action is contingent on arriving at a location.
+                *   ACTION: Convert the arrival clause into a Reach/Go to command.
+                *   EXAMPLE:
+                    `rise up when you get to the container.` -> `Go to the container. Rise up.`
+
+            *   3.4: Event-based Triggers (when [Subject] [Verb Phrase])
+                *   TRIGGER: An action is contingent on an environmental event described by a full clause (Subject + Verb), typically introduced by "when". This is distinct from perceiving a static object.
+                *   ACTION: Convert the event clause into a standalone declarative sentence (a statement of fact that acts as the trigger), followed by the main command.
+                *   CRITICAL DISTINCTION: This rule applies when the condition is an action or state change of an external entity (e.g., "the road turns", "the light changes"), not an action of the agent itself (like when you reach...).
+                *   EXAMPLE:
+                    `stop when the road turns to the right.` -> `The road turns to the right. Stop.`
+
+        *   PRIORITY 4: Decompose 'until'/'till' Clauses
+            *   RULE: This is a non-negotiable rule. Any instruction containing 'until' or 'till' MUST be decomposed. This process overrides any other logic to prevent ambiguity and processing loops.
+            *   ACTION:
+                *   Split the instruction into a sequence of separate sentences.
+                *   The action(s) before 'until'/'till' become one or more commands.
+                *   The goal condition after 'until'/'till' becomes the final command or statement.
+                *   The keyword 'until'/'till' is always removed.
+            *   Examples:
+                *   `go forward till the sixth street lamp.` -> `Go forward. Reach the sixth street lamp.`
+                *   `fly up until you are over the roof.` -> `Fly up. You are over the roof.`
+                *   `turn until facing the tower.` -> `Turn. Face the tower.`
+                *   `rise up until building disappears and turn left.` -> `Rise up. The building disappears and turn left.` (This second sentence would then be further split by Multi-Action Segmentation into: `The building disappears. Turn left.`)
+                *   `take off and fly until above the building.` -> `Take off. Fly. You are above the building.`
+                *   `take off and turn left until the yellow excavator is in the center.` -> `Take off. Turn left. The yellow excavator is in the center.`
+            *   (Special) Decompose Complex Pre-condition + 'until' Clause:
+                *   This is a special, high-priority rule for sentences that BOTH begin with a PRIORITY 0 pre-condition AND contain an 'until'/'till' clause.
+                *   CRITICAL EXAMPLE:
+                    *   `just after the tennis courts turn until facing the building then head straight.` -> `Pass the tennis courts. Turn. Face the building. Head straight.`
+
+        *   PRIORITY 5: Preserve Movement-Destination Integrity
+            *   RULE: A verb of motion (fly, go, move, head, etc.) followed immediately by to, toward, or towards and its destination object forms a single, non-decomposable command.
+            *   ACTION: Treat the entire [Motion Verb] to/toward(s) [Destination] phrase as one atomic unit. DO NOT attempt to split it or rephrase it (e.g., into Face... and Move...).
+            *   EXAMPLES:
+                `fly towards the building.` -> `Fly towards the building.`
+                `fly towards the building and turn left.` -> `Fly towards the building. Turn left.`
+                `fly straight over the roof of the brick building toward the white a shaped building. -> `Fly straight over the roof of the brick building toward the white A-shaped building.`
+                `swerve to the right of the edifice under construction towards a banner advertisement.` -> `Swerve to the right of the edifice under construction towards a banner advertisement.`
+
+        *   PRIORITY 6: Multi-Action Segmentation (One Core Verb Per Sentence)
+            *   Rule: Decompose any segment containing multiple independent verbs into separate sentences, even if they lack an explicit conjunction.
+            *   Primary Triggers: Multiple verbs, conjunctions (and, ,), participles acting as verbs.
+            *   Decomposition Patterns (Apply in order):
+                a) Intelligent Comma Handling (Appositive & Descriptive Phrases):
+                    *   RULE: If a comma introduces a descriptive phrase that modifies the preceding noun, do not split. Instead, merge the phrase into the command by removing the comma.
+                    *   Examples:
+                        *   `fly to the road, near the power lines.` -> `Fly to the road near the power lines.`
+                b) Standard Conjunction Split:
+                    *   Examples:
+                        *   `Take off and rise.` -> `Take off. Rise.`
+                        *   `Go forward, turn left.` -> `Go forward. Turn left.`
+                c) Implicit Sequence (Do NOT Split):
+                    *   Do NOT split if the following phrase functions as a modifier of the main command, rather than a new action. This applies under these specific conditions:
+                    *   Condition 1: Descriptive Modifier
+                        *   Applies when: The phrase describes or specifies the object of the main command.
+                        *   Examples:
+                            *   `fly to the building painted bright red.` -> `Fly to the building painted bright red.`
+                            *   `go straight to the water clarifies over the building ahead.` -> `Go straight to the water clarifies over the building ahead.`
+                    *   Condition 2: Directional/Manner Modifier
+                        *   Applies when: The phrase is a simple adverb or adverbial phrase (e.g., north, south, up, down, left, right, slowly, safely) that specifies the direction or manner of the entire preceding action.
+                        *   Examples:
+                            *   `go past that building south.` -> `Go past that building south.` (This correctly interprets 'south' as the direction of the 'go past' action).
+                            *   `fly over the bridge west.` -> `Fly over the bridge west.`
+                d) Participle as a Separate Action:
+                    *   `Land facing the fence and the wall.` -> `Land. Face the fence and the wall.`
+                    *   `Stop, looking at the sign. -> Stop. Look at the sign.`
+                e) Exception - Do Not Split Parallel Objects: If 'and' connects two noun phrases (objects/modifiers) governed by the same single verb, do not split.
+                    *   `Look at the car and the truck.` -> (No change)
+
+        *   PRIORITY 7: Decompose Actionable Perception/Orientation
+            *   Extract `See/Look at/Focus on [object].` as new sentences if they are distinct subsequent actions.
+            *   Example: `Move forward then focus on sign.` -> `Move forward. Focus on the sign.`
+
+
+    STEP D: Final Punctuation:
+        *   Ensure each final sentence ends with a single period ".".
+
+    --- KEY MANDATES (FINAL REMINDER) ---
+    *   Strictly follow Workflow and rule priorities.
+    *   Preserve original meaning and intent.
+    *   **Unconditional "until/till" Clause Splitting:** Per Step C, Priority 2 – this is critical.
+    *   Atomize actions thoroughly.
+
+    --- THINKING GUIDANCE (INTERNAL PROCESSING TRACE - EXTREME CONCISENESS) ---
+    If generating a <think> block, it MUST be an ultra-brief log of ONLY the most critical transformations applied to input segments, such as PRIORITY rule applications, significant multi-action splits, or pronoun resolutions.
+    Avoid all verbose explanations, input restatements, routine standardizations, or step-by-step A-B-C-D traces; focus SOLELY on noting major structural changes or semantic resolutions that lead to the final atomic units.
+
+"""
+
+
+
+
+LICENSE """                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+
+   APPENDIX: How to apply the Apache License to your work.
+
+      To apply the Apache License to your work, attach the following
+      boilerplate notice, with the fields enclosed by brackets "[]"
+      replaced with your own identifying information. (Don't include
+      the brackets!)  The text should be enclosed in the appropriate
+      comment syntax for the file format. We also recommend that a
+      file or class name and description of purpose be included on the
+      same "printed page" as the copyright notice for easier
+      identification within third-party archives.
+   Copyright 2024 Alibaba Cloud
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+       http://www.apache.org/licenses/LICENSE-2.0
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License."""
+

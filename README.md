@@ -100,10 +100,76 @@ The default project root is configured through `--project_prefix` in `src/common
 python -u ./src/vlnce_src/train.py --project_prefix /path/to/HTR_ws
 ```
 
+### Hierarchical Instruction Data
+
+HTR uses an offline Qwen-based parsing pipeline to construct the hierarchical task tree before training or evaluation. The parser reads AerialVLN-style episode JSON files and augments each episode's `instruction` field with multi-level semantic fields used by the navigation policy.
+
+The parser scripts and Ollama model definitions are provided in `Qwen/`:
+
+```text
+Qwen
+|-- loadInstruct00.py        # Stage 0: instruction standardization
+|-- loadInstruct01.py        # Stage 1: component parsing and subtask construction
+|-- loadInstruct02.py        # Stage 2: action/landmark element extraction
+|-- loadInstruct_simple.py   # Simple one-stage parser for ablation or comparison
+|-- qwen00.modelfile
+|-- qwen01.modelfile
+|-- qwen02.modelfile
+`-- qwen_simple.modelfile
+```
+
+The three-stage pipeline is:
+
+1. **Instruction standardization**: `loadInstruct00.py` uses `qwen00` to normalize raw navigation text and saves `preprocessed_text`.
+2. **Component parsing**: `loadInstruct01.py` uses `qwen01` to decompose each standardized instruction into `n.A`, `b.L`, and `o.L` components, then programmatically groups them into `Subtask` and `Component`.
+3. **Element extraction**: `loadInstruct02.py` extracts `nA` and `Ae` from action components, gathers landmark components as `nL`, and uses `qwen02` to extract landmark elements `Le`.
+
+After parsing, each episode instruction should contain:
+
+```text
+instruction
+|-- instruction_text
+|-- preprocessed_text
+|-- Subtask
+|-- Component
+|-- nA
+|-- nL
+|-- Ae
+`-- Le
+```
+
+Before running the parser, create the Ollama models from the provided modelfiles:
+
+```bash
+cd Qwen
+ollama create qwen00 -f qwen00.modelfile
+ollama create qwen01 -f qwen01.modelfile
+ollama create qwen02 -f qwen02.modelfile
+```
+
+Then set `JSON_FILE` in each `loadInstruct*.py` script to the target AerialVLN split file and run the stages sequentially:
+
+```bash
+python loadInstruct00.py
+python loadInstruct01.py
+python loadInstruct02.py
+```
+
+During model training and evaluation, `src/vlnce_src/env.py` encodes `Subtask`, `nA`, `nL`, `Ae`, and `Le` with the CLIP text encoder and provides them to the policy as:
+
+```text
+subtask_embedding
+nA_embedding
+nL_embedding
+Ae_embedding
+Le_embedding
+```
+
 ## Repository Structure
 
 ```text
 HTR
+|-- Qwen/                 # Offline Qwen parser for hierarchical task trees
 |-- airsim_plugin/        # AirSim simulator client and server utilities
 |-- Model/                # HTR policy, encoders, recurrent modules, losses
 |-- scripts/              # Example scripts for dataset download, training, evaluation
